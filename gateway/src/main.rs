@@ -45,10 +45,21 @@ pub struct SenderInfo {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Attachment {
+    pub url: String,
+    pub content_type: Option<String>,
+    pub filename: Option<String>,
+    pub size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Content {
     #[serde(rename = "type")]
     pub content_type: String,
-    pub text: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 // --- Reply schema (ADR openab.gateway.reply.v1) ---
@@ -153,6 +164,7 @@ struct AppState {
     /// the first client to `remove()` a token wins the free Reply API call;
     /// other clients for the same event naturally fall back to Push API.
     reply_token_cache: ReplyTokenCache,
+    public_url: String,
 }
 
 // --- Telegram webhook handler ---
@@ -228,7 +240,8 @@ async fn telegram_webhook(
         },
         content: Content {
             content_type: "text".into(),
-            text: text.into(),
+            text: Some(text.into()),
+            attachments: vec![],
         },
         mentions,
         message_id: msg.message_id.to_string(),
@@ -275,6 +288,10 @@ struct LineMessage {
     #[serde(rename = "type")]
     message_type: String,
     text: Option<String>,
+    #[serde(rename = "fileName")]
+    file_name: Option<String>,
+    #[serde(rename = "fileSize")]
+    file_size: Option<u64>,
 }
 
 // --- LINE webhook handler ---
@@ -320,17 +337,31 @@ async fn line_webhook(
         if event.event_type != "message" {
             continue;
         }
-        let Some(ref msg) = event.message else {
-            continue;
-        };
-        if msg.message_type != "text" {
-            continue;
-        }
-        let Some(ref text) = msg.text else {
-            continue;
-        };
-        if text.trim().is_empty() {
-            continue;
+        let mut text = msg.text.clone();
+        let mut attachments = vec![];
+
+        match msg.message_type.as_str() {
+            "text" => {
+                if text.as_deref().unwrap_or("").trim().is_empty() {
+                    continue;
+                }
+            }
+            "image" | "video" | "audio" | "file" => {
+                let mime = match msg.message_type.as_str() {
+                    "image" => "image/jpeg",
+                    "video" => "video/mp4",
+                    "audio" => "audio/mp4",
+                    "file" => "application/octet-stream",
+                    _ => "application/octet-stream",
+                };
+                attachments.push(Attachment {
+                    url: format!("{}/media/{}", state.public_url, msg.id),
+                    content_type: Some(mime.to_string()),
+                    filename: msg.file_name.clone().or_else(|| Some(format!("{}.bin", msg.id))),
+                    size: msg.file_size,
+                });
+            }
+            _ => continue,
         }
 
         let source = event.source.as_ref();
@@ -379,8 +410,9 @@ async fn line_webhook(
                 is_bot: false,
             },
             content: Content {
-                content_type: "text".into(),
-                text: text.clone(),
+                content_type: if msg.message_type == "text" { "text".into() } else { msg.message_type.clone() },
+                text,
+                attachments,
             },
             mentions: vec![],
             message_id: msg.id.clone(),
@@ -462,7 +494,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                 .post(&url)
                                 .json(&serde_json::json!({
                                     "chat_id": reply.channel.id,
-                                    "name": reply.content.text,
+                                    "name": reply.content.text.unwrap_or_default(),
                                 }))
                                 .send()
                                 .await;
@@ -517,7 +549,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             || reply.command.as_deref() == Some("remove_reaction")
                         {
                             let msg_key = format!("{}:{}", reply.channel.id, reply.reply_to);
-                            let emoji = &reply.content.text;
+                            let emoji = reply.content.text.as_deref().unwrap_or("");
                             // Map unsupported emojis to Telegram-compatible ones
                             let tg_emoji = match emoji.as_str() {
                                 "🆗" => "👍",
@@ -586,7 +618,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                 .post(&url)
                                 .json(&serde_json::json!({
                                     "chat_id": reply.channel.id,
-                                    "text": reply.content.text,
+                                    "text": reply.content.text.unwrap_or_default(),
                                     "message_thread_id": reply.channel.thread_id,
                                     "parse_mode": "Markdown",
                                 }))
@@ -645,7 +677,7 @@ async fn dispatch_line_reply(
             .bearer_auth(access_token)
             .json(&serde_json::json!({
                 "replyToken": reply_token,
-                "messages": [{"type": "text", "text": reply.content.text}]
+                "messages": [{"type": "text", "text": reply.content.text.unwrap_or_default()}]
             }))
             .send()
             .await;
@@ -682,7 +714,7 @@ async fn dispatch_line_reply(
             .bearer_auth(access_token)
             .json(&serde_json::json!({
                 "to": reply.channel.id,
-                "messages": [{"type": "text", "text": reply.content.text}]
+                "messages": [{"type": "text", "text": reply.content.text.unwrap_or_default()}]
             }))
             .send()
             .await
@@ -690,6 +722,52 @@ async fn dispatch_line_reply(
     }
 
     used_reply
+}
+
+async fn line_media_proxy(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(message_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let access_token = match &state.line_access_token {
+        Some(token) => token,
+        None => {
+            warn!("Media requested but LINE_CHANNEL_ACCESS_TOKEN is missing");
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
+    };
+
+    let url = format!("https://api-data.line.me/v2/bot/message/{}/content", message_id);
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).bearer_auth(access_token).send().await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let mut response = axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK);
+            if let Some(ct) = r.headers().get(reqwest::header::CONTENT_TYPE) {
+                response = response.header(axum::http::header::CONTENT_TYPE, ct);
+            }
+            if let Some(cl) = r.headers().get(reqwest::header::CONTENT_LENGTH) {
+                response = response.header(axum::http::header::CONTENT_LENGTH, cl);
+            }
+            let bytes = match r.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Error reading media bytes from LINE: {e}");
+                    return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            response.body(axum::body::Body::from(bytes)).unwrap()
+        }
+        Ok(r) => {
+            warn!(status = %r.status(), "LINE media proxy failed");
+            axum::http::StatusCode::NOT_FOUND.into_response()
+        }
+        Err(e) => {
+            error!("LINE media proxy network error: {e}");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 // --- Health check ---
@@ -721,6 +799,9 @@ async fn main() -> Result<()> {
     if ws_token.is_none() {
         warn!("GATEWAY_WS_TOKEN not set — WebSocket connections are NOT authenticated (insecure)");
     }
+    
+    let public_url = std::env::var("GATEWAY_PUBLIC_URL")
+        .unwrap_or_else(|_| format!("http://127.0.0.1:{}", listen_addr.split(':').last().unwrap_or("8080")));
 
     let (event_tx, _) = broadcast::channel::<String>(256);
     let reply_token_cache: ReplyTokenCache =
@@ -734,6 +815,7 @@ async fn main() -> Result<()> {
         line_access_token,
         event_tx,
         reply_token_cache,
+        public_url,
     });
 
     // Background task: sweep expired reply tokens every REPLY_TOKEN_TTL_SECS
@@ -760,6 +842,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route(&webhook_path, post(telegram_webhook))
         .route("/webhook/line", post(line_webhook))
+        .route("/media/:message_id", get(line_media_proxy))
         .route("/ws", get(ws_handler))
         .route("/health", get(health))
         .with_state(state);
